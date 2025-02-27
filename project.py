@@ -1,6 +1,8 @@
 import pandas as pd
 from google.cloud import bigquery
 import unicodedata
+import re
+from fuzzywuzzy import fuzz
 
 # Initialize BigQuery client
 client = bigquery.Client(project="steadfast-task-437611-f3")
@@ -114,47 +116,59 @@ df_inv = df_inv.merge(df_authors, on="author_id", how="left")
 def normalize_name(name):
     if pd.isna(name):
         return ""
-
-    # Convert to string, strip spaces
+    # Convert to string, strip, lower case
     name = str(name).strip().lower()
-    # Replace all types of hyphens and dashes with spaces
+    # Replace various hyphens/dashes with a space
     name = name.replace("-", " ").replace("‐", " ").replace("⁎", " ")
-    # Normalize accents to basic Latin (optional)
+    # Remove punctuation
+    name = re.sub(r'[^\w\s]', '', name)
+    # Collapse multiple spaces into one
+    name = re.sub(r'\s+', ' ', name)
+    # Normalize Unicode characters (e.g., accents)
     name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("utf-8")
     return name
 
-
-def match_names(row):
-    inv_name = normalize_name(row["Nombre_apellidos"])
-    auth_name = normalize_name(row.get("display_name", ""))
-    alt_names = row.get("display_name_alternatives", "")
-
-    # Convert alternatives into a list (assuming they are comma-separated)
+# Function to compute fuzzy matching score
+def fuzzy_match_score(inv_name, auth_name, alt_names):
+    # Compute primary fuzzy score
+    score_primary = fuzz.token_set_ratio(inv_name, auth_name)
+    # Process alternative names (if any)
     alt_list = [normalize_name(n) for n in str(alt_names).split(",")] if alt_names else []
+    score_alts = [fuzz.token_set_ratio(inv_name, alt) for alt in alt_list] if alt_list else [0]
+    return max(score_primary, max(score_alts))
 
-    if inv_name == auth_name or inv_name in alt_list:
-        return True
-    return False
+# --- After merging df_inv with works, authorships, and authors ---
+# (Assuming df_inv now contains columns: ID, Nombre_apellidos, work_id, author_id,
+# author_position, display_name, display_name_alternatives, etc.)
 
-df_inv["name_match"] = df_inv.apply(match_names, axis=1)
+# Precompute a normalized investigator name
+df_inv["normalized_inv_name"] = df_inv["Nombre_apellidos"].apply(normalize_name)
 
-# Keep only rows where we found a match
-df_matched = df_inv[df_inv["name_match"]].copy()
+# Compute fuzzy match score for each candidate row
+df_inv["fuzzy_score"] = df_inv.apply(
+    lambda row: fuzzy_match_score(
+        row["normalized_inv_name"],
+        normalize_name(row.get("display_name", "")),
+        row.get("display_name_alternatives", "")
+    ),
+    axis=1
+)
 
+# For each investigator (using the unique ID), select the candidate with the highest fuzzy score
+df_best = df_inv.loc[df_inv.groupby("ID")["fuzzy_score"].idxmax()].copy()
 
-# -----------------------
-# Step 6: Update Alex_ID and Author_Pos Columns
-# -----------------------
-df_matched["Alex_ID"] = df_matched["author_id"].apply(lambda x: f"https://openalex.org/A{x}" if pd.notna(x) else None)
-df_inv["Author_Pos"] = df_inv["Author_Pos"].combine_first(df_inv["author_position"])
+# Set a threshold for a good match (e.g., 90)
+threshold = 90
+# If the best score for an investigator is below the threshold, treat it as no match
+df_best.loc[df_best["fuzzy_score"] < threshold, ["author_id", "author_position", "display_name", "display_name_alternatives"]] = None
 
-# -----------------------
-# Step 7: Preserve All Original Data and Keep Order by ID
-# -----------------------
-df_final = df_inv.copy()  # Start with full dataset
-df_final.update(df_matched)  # Update only matched rows
-df_final.sort_values("ID", inplace=True)  # Preserve order
-df_final = df_final.drop_duplicates(subset=["ID"], keep="first")
+# Update Alex_ID and Author_Pos using the best match candidate
+df_best["Alex_ID"] = df_best["author_id"].apply(lambda x: f"https://openalex.org/A{x}" if pd.notna(x) else None)
+df_best["Author_Pos"] = df_best["author_position"]
+
+# If needed, update your original investigators table with the best matches
+# Here we sort and drop duplicates by the investigator's ID
+df_final = df_best.sort_values("ID").drop_duplicates(subset=["ID"], keep="first")
 
 # -----------------------
 # Step 8: Save Results to a New Table (Safe Test Table)
