@@ -8,8 +8,8 @@ import unicodedata
 # Initialize BigQuery client
 client = bigquery.Client(project="steadfast-task-437611-f3")
 
-# Load Investigators Table (original rows)
-query_inv = "SELECT * FROM userdb_JC.investigadores_temp9"
+# Load Investigators Table (original rows; each row should be unique per investigator)
+query_inv = "SELECT * FROM userdb_JC.investigadores_temp10"
 df_inv = client.query(query_inv).to_dataframe()
 
 # -----------------------
@@ -28,13 +28,12 @@ job_config_works = bigquery.QueryJobConfig(
 )
 df_works = client.query(query_works, job_config=job_config_works).to_dataframe()
 
-# LEFT JOIN to keep all original rows
+# LEFT JOIN so that all original rows remain
 df_inv = df_inv.merge(df_works, on="doi", how="left")
 
 # Get Authorship Info for Each Work ID
 df_inv["work_id"] = pd.to_numeric(df_inv["work_id"], errors="coerce").astype("Int64")
 work_id_list = df_inv["work_id"].dropna().astype(int).tolist()
-
 if work_id_list:
     query_authorships = """
     SELECT wa.work_id, wa.author_position, wa.author_id
@@ -54,7 +53,6 @@ df_inv = df_inv.merge(df_authorships, on="work_id", how="left")
 # Get Author Details from Authors Table
 df_inv["author_id"] = pd.to_numeric(df_inv["author_id"], errors="coerce").astype("Int64")
 author_id_list = df_inv["author_id"].dropna().astype(int).tolist()
-
 if author_id_list:
     query_authors = """
     SELECT a.id AS author_id, a.display_name
@@ -75,7 +73,7 @@ df_inv = df_inv.merge(df_authors, on="author_id", how="left")
 # Step 2: Fuzzy matching
 # -----------------------
 
-# Function to normalize names
+# Define a function to normalize names
 def normalize_name(name):
     if pd.isna(name):
         return ""
@@ -84,7 +82,7 @@ def normalize_name(name):
     name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("utf-8")
     return name
 
-# Function to compute fuzzy score
+# Define a function to compute fuzzy score
 def fuzzy_match_score(inv_name, auth_name):
     return fuzz.token_set_ratio(inv_name, auth_name)
 
@@ -105,28 +103,35 @@ df_inv.loc[df_inv["fuzzy_score"] < threshold, ["author_id", "author_position", "
 df_inv["Author_order"] = df_inv["author_position"]
 
 # -----------------------
-# Step 3: Map Best Match by Investigator
+# Step 3: Map Best Match and Overwrite
 # -----------------------
 
 # For each investigator (by ID), choose the row with the highest fuzzy_score.
-# This mapping picks the best match without duplicating rows.
+# This produces one best-match row per investigator.
 df_best = df_inv.loc[df_inv.groupby("ID")["fuzzy_score"].idxmax()]
 
-# Build a mapping from ID to Author_order based on best match
+# Build mappings from ID to best matching author_id and Author_order
 author_order_mapping = df_best.set_index("ID")["Author_order"].to_dict()
+author_id_mapping = df_best.set_index("ID")["author_id"].to_dict()
 
-# Update the original DataFrame with the best Author_order for each row (preserving all rows)
+# Update the original DataFrame with the best match values using the mapping.
+# This effectively overwrites rows with the best match without creating new rows.
 df_inv["Author_order"] = df_inv["ID"].map(author_order_mapping)
+df_inv["author_id"] = df_inv["ID"].map(author_id_mapping)
 
 # -----------------------
-# Step 4: Cleanup and Finalize
+# Step 4: Deduplicate and Cleanup
 # -----------------------
 
-# Drop extra columns added for matching
+# Group by the unique investigator ID to collapse any duplicates resulting from the joins.
+# Here we take the first non-null value for each column.
+df_dedup = df_inv.groupby("ID", as_index=False).first()
+
+# Drop extra columns used for matching that are not needed in the final output.
 columns_to_drop = ["work_id", "display_name", "normalized_inv_name", "fuzzy_score"]
-df_final = df_inv.drop(columns=columns_to_drop, errors="ignore")
+df_final = df_dedup.drop(columns=columns_to_drop, errors="ignore")
 
-# Reorder columns to match the original table structure
+# Reorder columns to match the original table structure.
 # (Assuming original columns are: Nombre, Apellido_1, Apellido_2, Nombre_apellidos,
 #  Trabajo_institucion, Ano_beca, Pais, ID, GS, doi, Author_order, Alex_id, author_id)
 desired_order = ["Nombre", "Apellido_1", "Apellido_2", "Nombre_apellidos",
@@ -134,8 +139,7 @@ desired_order = ["Nombre", "Apellido_1", "Apellido_2", "Nombre_apellidos",
                  "Author_order", "Alex_id", "author_id"]
 df_final = df_final.reindex(columns=desired_order)
 
-# Drop duplicate rows (keeping the first occurrence) and sort by ID
-df_final = df_final.drop_duplicates()
+# Sort the final DataFrame by ID (numeric sort)
 df_final["ID"] = pd.to_numeric(df_final["ID"], errors="coerce")
 df_final = df_final.sort_values("ID")
 
@@ -143,7 +147,7 @@ df_final = df_final.sort_values("ID")
 # Step 5: Save to BigQuery
 # -----------------------
 
-destination_table = "userdb_JC.investigadores_temp9"
+destination_table = "userdb_JC.investigadores_temp10"
 df_final.to_gbq(destination_table, project_id="steadfast-task-437611-f3", if_exists="replace")
 
 print(f"✅ Table {destination_table} has been successfully created in BigQuery.")

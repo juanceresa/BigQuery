@@ -7,18 +7,16 @@ from fuzzywuzzy import fuzz
 # Initialize BigQuery client
 client = bigquery.Client(project="steadfast-task-437611-f3")
 
-# -----------------------
-# Step 1: Load Investigators Table (Original Data)
-# -----------------------
+
+# Load Investigators Table (Original Data)
 query_inv = """
 SELECT ID, DOI AS doi, Nombre_apellidos, Alex_ID, Author_Pos
 FROM userdb_JC.investigadores
 """
 df_inv = client.query(query_inv).to_dataframe()
 
-# -----------------------
-# Step 2: Find Work IDs from OpenAlex
-# -----------------------
+
+# Find Work IDs from OpenAlex
 query_works = """
 SELECT
     w.id AS work_id,
@@ -36,9 +34,8 @@ df_works = client.query(query_works, job_config=job_config_works).to_dataframe()
 # Merge the work_id into df_inv on 'doi'
 df_inv = df_inv.merge(df_works, on="doi", how="left")
 
-# -----------------------
-# Step 3: Get Authorship Info for Each Work ID
-# -----------------------
+
+# Get Authorship Info for Each Work ID
 df_inv["work_id"] = pd.to_numeric(df_inv["work_id"], errors="coerce")
 work_id_list = df_inv["work_id"].dropna().astype(int).tolist()
 
@@ -63,9 +60,8 @@ else:
 # Merge authorship info with df_inv on work_id.
 df_inv = df_inv.merge(df_authorships, on="work_id", how="left")
 
-# -----------------------
-# Step 4: Get Author Details from Authors Table (Including Alternative Names)
-# -----------------------
+
+# Get Author Details from Authors Table (Including Alternative Names)
 df_inv["author_id"] = pd.to_numeric(df_inv["author_id"], errors="coerce")
 author_id_list = df_inv["author_id"].dropna().astype(int).tolist()
 
@@ -109,10 +105,8 @@ else:
 # Merge the author details into df_inv
 df_inv = df_inv.merge(df_authors, on="author_id", how="left")
 
-# -----------------------
-# Step 5: Compare Investigator Name to Author Names (Including Alternative Names)
-# -----------------------
 
+# Compare Investigator Name to Author Names (Including Alternative Names)
 def normalize_name(name):
     if pd.isna(name):
         return ""
@@ -163,16 +157,15 @@ threshold = 90
 df_best.loc[df_best["fuzzy_score"] < threshold, ["author_id", "author_position", "display_name", "display_name_alternatives"]] = None
 
 # Update Alex_ID and Author_Pos using the best match candidate
-df_best["Alex_ID"] = df_best["author_id"].apply(lambda x: f"https://openalex.org/A{x}" if pd.notna(x) else None)
+df_best["Alex_ID"] = df_best["author_id"].apply(lambda x: f"https://openalex.org/A{int(x)}" if pd.notna(x) else None)
 df_best["Author_Pos"] = df_best["author_position"]
 
 # If needed, update your original investigators table with the best matches
 # Here we sort and drop duplicates by the investigator's ID
 df_final = df_best.sort_values("ID").drop_duplicates(subset=["ID"], keep="first")
 
-# -----------------------
-# Step 8: Save Results to a New Table (Safe Test Table)
-# -----------------------
+
+# Save Results to a New Table (Safe Test Table)
 table_id = "userdb_JC.investigadores_temp"
 job_config_load = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
 client.load_table_from_dataframe(df_final, table_id, job_config=job_config_load).result()
