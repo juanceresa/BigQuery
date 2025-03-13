@@ -4,6 +4,9 @@ import unicodedata
 import re
 from fuzzywuzzy import fuzz
 
+''' Project: Investigator Matching. Beginning Script that attempts to match investigators to authors in OpenAlex database
+    hosted in BitQuery. The script will load the investigators table, find the work IDs from OpenAlex, get authorship'''
+
 # Initialize BigQuery client
 client = bigquery.Client(project="steadfast-task-437611-f3")
 
