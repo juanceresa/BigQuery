@@ -82,15 +82,15 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
     if ins == "universidad pontificia de comillas en santander":
         ins = "comillas pontifical university"
     if ins == "universidad de valencia y tribunal de justicia de la comunidad valenciana" or ins == "universidad de valencia y consellería de sanitat i consum de la generalitat valenciana" or ins == "universidad literaria de valencia":
-        ins == "Universitat de València"
+        ins = "Universitat de València"
     if ins == "universidad de les illes balears":
-        ins == "Universitat de les Illes Balears"
+        ins = "Universitat de les Illes Balears"
     if ins == "consejo superior de investigaciones cientificas" or ins == "consejo superior de investigaciones científicas idibaps":
-        ins == "Consejo Superior de Investigaciones Científicas"
+        ins = "Consejo Superior de Investigaciones Científicas"
     if ins == "universidad nacional de eduación a distancia":
-        ins == "National University of Distance Education"
+        ins = "National University of Distance Education"
     if ins == "universidad técnica de dinamarca":
-        ins == "Technical University of Denmark"
+        ins = "Technical University of Denmark"
 
 
    # Remove text after parentheses (), commas ,, slashes /, and dashes -
