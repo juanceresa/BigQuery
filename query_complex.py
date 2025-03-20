@@ -85,17 +85,21 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
         ins = "Universitat de València"
     if ins == "universidad de les illes balears":
         ins = "Universitat de les Illes Balears"
-    if ins == "consejo superior de investigaciones cientificas" or ins == "consejo superior de investigaciones científicas idibaps":
+    if ins == "consejo superior de investigaciones cientificas, csic" or ins == "consejo superior de investigaciones científicas idibaps":
         ins = "Consejo Superior de Investigaciones Científicas"
-    if ins == "universidad nacional de eduación a distancia":
+    if ins == "universidad nacional de eduación a distancia, uned":
         ins = "National University of Distance Education"
     if ins == "universidad técnica de dinamarca":
         ins = "Technical University of Denmark"
-
+    if ins == "universidad de potsdam":
+        ins = "University of Potsdam"
+    if ins == "universidad de algarve":
+        ins = "University of Algarve"
+    if ins == "universidad rey juan carlos i":
+        ins = "Universidad Rey Juan Carlos"
 
    # Remove text after parentheses (), commas ,, slashes /, and dashes -
-    ins_clean = re.sub(r"\s*(\(.*?\)|,.*|/.*|-.*)", "", ins).strip()
-
+    ins_clean = re.sub(r"\s*(\(.*?\)|,.*|/.*|-.*)", "", ins or "").strip()
 
     # In the OpenAlex API to filter on institutions we first find the institution ID and then use it in the author search.
     # We will cache the institution ID for each unique institution name to avoid redundant API calls.
@@ -104,24 +108,24 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
         try:
             response = requests.get(institution_search)
             if response.status_code != 200:
-                print(f"Error fetching OpenAlex institution data for '{ins_clean}': status code {response.status_code}")
+                print(f"Error fetching OpenAlex institution data for '{ins}': status code {response.status_code}")
                 return None, None
             data = response.json()
             if not data.get("results"):
-                print(f"No institution results for '{ins_clean}'")
+                print(f"No institution results for '{ins}'")
                 return None, None
             ins_id = data["results"][0]["id"]
             ins_id_dict[ins_clean] = ins_id
         except Exception as e:
-            print(f"Error fetching OpenAlex institution data for '{ins_clean}': {e}")
+            print(f"Error fetching OpenAlex institution data for '{ins}': {e}")
             return None, None
     else:
         ins_id = ins_id_dict[ins_clean]
 
 
     # functionality that dynamically builds the OpenAlex API URL based on the information
-    base_autocomplete_url = "https://api.openalex.org/autocomplete/authors?"
-    url = f"{base_autocomplete_url}search={q_name}&mailto={email}"
+    url = "https://api.openalex.org/authors?"
+    url = f"{url}search={q_name}&mailto={email}"
 
     try:
         response = requests.get(url)
@@ -141,17 +145,25 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
     # Iterate sover the results from our first query
     if data.get("meta", {}).get("count", 0) > 0:
         for candidate in data["results"]:
-
             candidate_name = candidate.get("display_name", "")
-            candidate_display_name_alternatives = candidate.get("display_name_alternatives", "")
+            candidate_name_norm = candidate_name.strip().lower()
 
-            # Case 1: Exact match using full name to display name or display name alternatives
-            if candidate_name == full_name or full_name in candidate_display_name_alternatives:
+            candidate_display_name_alternatives = candidate.get("display_name_alternatives", "")
+            # Normalize each alternative name in the list
+            alternatives_norm = [alt.strip().lower() for alt in candidate_display_name_alternatives]
+
+            full_name_norm = full_name.strip().lower()
+
+            # Case 1: Exact match on candidate_name or a match in the alternatives list
+            if candidate_name_norm == full_name_norm or any(full_name_norm == alt for alt in alternatives_norm):
                 gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
+                print("Case 1")
                 return None, None
 
             affiliations = candidate.get("affiliations", [])
-            candidate_institutions = [aff["id"] for aff in affiliations] if affiliations else []
+            candidate_institutions = [aff.get("institution", {}).get("id", "")
+                          for aff in affiliations
+                          if aff.get("institution", {}).get("id")]
 
             # Case 2: Found match on institution ID
             if (ins_id and ins_id in candidate_institutions):
@@ -171,6 +183,7 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
                         for potential_concept in potential_candidate_x_concepts:
                             if ex_concept.get("display_name") == potential_concept.get("display_name"):
                                 gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
+                                print("Case 3")
                                 return None, None
 
     return None, None
