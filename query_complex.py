@@ -28,10 +28,43 @@ FROM userdb_JC.investigadores_template
 """
 df_main = client.query(query_inv).to_dataframe()
 
+# Create a global cache for candidate data
 candidate_dict = {}
-
 # Create a global cache for institution IDs
 ins_id_dict = {}
+
+def gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives):
+        candidate_alex_id = candidate.get("id", "")
+        # orcid, scopus
+        # Safely extract only 'orcid' and 'scopus' if they exist
+        other_ids = candidate.get("ids", {})
+        candidate_orc_id = ", ".join(f"{k}: {v}" for k, v in other_ids.items() if k in ["orcid"])
+        candidate_scopus_id = ", ".join(f"{k}: {v}" for k, v in other_ids.items() if k in ["scopus"])
+        candidate_works_count = candidate.get("citation_count", "")
+        candidate_cited_by_count = candidate.get("cited_by_count", "")
+        # gather summary_stats for 2yr_mean_citedness, h_index, i10_index
+        summary_stats = candidate.get("summary_stats", {})
+        candidate_summary_stats = ", ".join(f"{k}: {v}" for k, v in summary_stats.items())
+        # Process x_concepts safely by checking if the list is not empty
+        x_concepts = candidate.get("x_concepts", [])
+        candidate_field = x_concepts[0].get("display_name", "") if x_concepts else ""
+        # Create a tuple with the candidate information
+        candidate_tuple = (
+            fs_id,
+            candidate_name,
+            candidate_display_name_alternatives,
+            candidate_field,
+            candidate_alex_id,
+            candidate_orc_id,
+            candidate_scopus_id,
+            candidate_works_count,
+            candidate_cited_by_count,
+            candidate_summary_stats,
+            x_concepts
+        )
+        # Append the candidate tuple to the dictionary that uses fs_id as the key
+        candidate_dict[fs_id].append(candidate_tuple)
+
 
 def search_openalex(fs_id, q_name, full_name, pais, ins):
     """Query OpenAlex API with a general query and refine"""
@@ -39,21 +72,35 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
     email = "jcere@umich.edu"
     ins_id = None
 
-    # Specific case: name of university in Catalan
+    # # Specific cases
     if ins == "universidad politécnica de catalunya":
         ins = "universitat politècnica de catalunya"
-    if ins == "universidad de valencia":
-        ins = "universitat de valència"
     if ins == "universidad de alcalá de henares":
         ins = "universidad de alcalá"
+    if ins == "universidad pública de navarra" or ins == "universidad de navarra en barcelona":
+        ins = "universidad publica de navarra"
+    if ins == "universidad pontificia de comillas en santander":
+        ins = "comillas pontifical university"
+    if ins == "universidad de valencia y tribunal de justicia de la comunidad valenciana" or ins == "universidad de valencia y consellería de sanitat i consum de la generalitat valenciana" or ins == "universidad literaria de valencia":
+        ins == "Universitat de València"
+    if ins == "universidad de les illes balears":
+        ins == "Universitat de les Illes Balears"
+    if ins == "consejo superior de investigaciones cientificas" or ins == "consejo superior de investigaciones científicas idibaps":
+        ins == "Consejo Superior de Investigaciones Científicas"
+    if ins == "universidad nacional de eduación a distancia":
+        ins == "National University of Distance Education"
+    if ins == "universidad técnica de dinamarca":
+        ins == "Technical University of Denmark"
 
-    # Remove text within parentheses and after commas and assign the cleaned institution name
-    ins_clean = re.sub(r"\s*(\(.*?\)|,.*|/.*)", "", ins).strip()
+
+   # Remove text after parentheses (), commas ,, slashes /, and dashes -
+    ins_clean = re.sub(r"\s*(\(.*?\)|,.*|/.*|-.*)", "", ins).strip()
+
 
     # In the OpenAlex API to filter on institutions we first find the institution ID and then use it in the author search.
     # We will cache the institution ID for each unique institution name to avoid redundant API calls.
     if ins_clean not in ins_id_dict:
-        institution_search = f"https://api.openalex.org/autocomplete/institutions?q={ins_clean}&mailto={email}"
+        institution_search = f"https://api.openalex.org/institutions?search={ins_clean}&mailto={email}"
         try:
             response = requests.get(institution_search)
             if response.status_code != 200:
@@ -72,7 +119,7 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
         ins_id = ins_id_dict[ins_clean]
 
 
-    # functionality that dynamically builds the OpenAlex API URL based on the information if found.
+    # functionality that dynamically builds the OpenAlex API URL based on the information
     base_autocomplete_url = "https://api.openalex.org/autocomplete/authors?"
     url = f"{base_autocomplete_url}search={q_name}&mailto={email}"
 
@@ -90,58 +137,42 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
     if fs_id not in candidate_dict:
         candidate_dict[fs_id] = []
 
-    # Create candidates list to store in the dictionary to save multiple profiles for the same fs_id
+    # Loop to create candidates list, stores multiple profiles per fs_id
+    # Iterate sover the results from our first query
     if data.get("meta", {}).get("count", 0) > 0:
-        # Iterate over the results, now we need to filter by institution, country
         for candidate in data["results"]:
 
             candidate_name = candidate.get("display_name", "")
             candidate_display_name_alternatives = candidate.get("display_name_alternatives", "")
 
-            if candidate_name == full_name:
-                
+            # Case 1: Exact match using full name to display name or display name alternatives
+            if candidate_name == full_name or full_name in candidate_display_name_alternatives:
+                gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
+                return None, None
 
-            # Matching process on our institution and country
             affiliations = candidate.get("affiliations", [])
-            candidate_country = candidate.get("last_known_institution", {}).get("country_code", "")
             candidate_institutions = [aff["id"] for aff in affiliations] if affiliations else []
 
+            # Case 2: Found match on institution ID
+            if (ins_id and ins_id in candidate_institutions):
+                gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
+                return None, None
 
-            candidate_alex_id = candidate.get("id", "")
+            # Case 3: LAST RESORT, no match on name, inst. If we have found profile for this fs_id, we review x_concepts score
+            # LOGIC: check if we already have a profile for this fs_id
+            # if we do, check if the x_concepts match with the potential candidate profile
+            # if match, gather data
+            potential_candidate_x_concepts = candidate.get("x_concepts", [])
 
-            # orcid, scopus
-            # Safely extract only 'orcid' and 'scopus' if they exist
-            other_ids = candidate.get("ids", {})
-            candidate_orc_id = ", ".join(f"{k}: {v}" for k, v in other_ids.items() if k in ["orcid"])
-            candidate_scopus_id = ", ".join(f"{k}: {v}" for k, v in other_ids.items() if k in ["scopus"])
+            if fs_id in candidate_dict:
+                for candidate_tuple in candidate_dict[fs_id]:
+                    existing_x_concepts = candidate_tuple[-1]  # List of x_concepts dictionaries from the stored candidate
+                    for ex_concept in existing_x_concepts:
+                        for potential_concept in potential_candidate_x_concepts:
+                            if ex_concept.get("display_name") == potential_concept.get("display_name"):
+                                gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
+                                return None, None
 
-            candidate_works_count = candidate.get("citation_count", "")
-            candidate_cited_by_count = candidate.get("cited_by_count", "")
-
-            # gather summary_stats for 2yr_mean_citedness, h_index, i10_index
-            summary_stats = candidate.get("summary_stats", {})
-            candidate_summary_stats = ", ".join(f"{k}: {v}" for k, v in summary_stats.items())
-
-            # Process x_concepts safely by checking if the list is not empty
-            x_concepts = candidate.get("x_concepts", [])
-            candidate_field = x_concepts[0].get("display_name", "") if x_concepts else ""
-
-            # Create a tuple with the candidate information
-            candidate_tuple = (
-                fs_id,
-                candidate_name,
-                candidate_display_name_alternatives,
-                candidate_field,
-                candidate_alex_id,
-                candidate_orc_id,
-                candidate_scopus_id,
-                candidate_works_count,
-                candidate_cited_by_count,
-                candidate_summary_stats,
-            )
-
-            # Append the candidate tuple to the dictionary that uses fs_id as the key
-            candidate_dict[fs_id].append(candidate_tuple)
     return None, None
 
 # Process all researchers to build candidate_dict
@@ -154,7 +185,8 @@ for i, (fs_id, name, ap1, full_name, pais, ins) in enumerate(
 # Create a DataFrame for all candidate rows after processing all researchers
 candidate_rows = []
 for fs_id, candidates in candidate_dict.items():
-    df_candidates = pd.DataFrame(candidates, columns=[
+    # Drops the x_concepts column from the candidate tuple, as it is not needed in the final DataFrame
+    df_candidates = pd.DataFrame([t[:-1] for t in candidates], columns=[
         "fs_id",
         "candidate_name",
         "candidate_display_name_alternatives",
@@ -168,26 +200,11 @@ for fs_id, candidates in candidate_dict.items():
     ])
     candidate_rows.append(df_candidates)
 
-if candidate_rows:
     # Concatenate all candidate DataFrames into one
     df_candidates_final = pd.concat(candidate_rows, ignore_index=True)
 
     # Sort the DataFrame by fs_id in ascending order
     df_candidates_final = df_candidates_final.sort_values(by="fs_id").reset_index(drop=True)
-else:
-    # If no candidates found, create an empty DataFrame with columns matching the expected schema
-    df_candidates_final = pd.DataFrame(columns=[
-        "fs_id",
-        "candidate_name",
-        "candidate_display_name_alternatives",
-        "candidate_field",
-        "candidate_alex_id",
-        "candidate_orc_id",
-        "candidate_scopus_id",
-        "candidate_works_count",
-        "candidate_cited_by_count",
-        "candidate_summary_stats",
-    ])
 
 # Merge with the original df_main based on fs_id (ID)
 df_final = df_main.merge(df_candidates_final, left_on="ID", right_on="fs_id", how="left")
