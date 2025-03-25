@@ -4,6 +4,7 @@ from google.cloud import bigquery
 import re
 import json
 import os
+import difflib
 
 # Global file for caching institution IDs
 cache_file = "ins_id_cache.json"
@@ -41,37 +42,39 @@ df_main = client.query(query_inv).to_dataframe()
 
 # Create a global cache for candidate data
 candidate_dict = {}
-# Create a global cache for institution IDs
-ins_id_dict = {}
+
 
 def gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives):
         candidate_alex_id = candidate.get("id", "")
         # orcid, scopus
         # Safely extract only 'orcid' and 'scopus' if they exist
         other_ids = candidate.get("ids", {})
-        candidate_orc_id = ", ".join(f"{k}: {v}" for k, v in other_ids.items() if k in ["orcid"])
-        candidate_scopus_id = ", ".join(f"{k}: {v}" for k, v in other_ids.items() if k in ["scopus"])
-        candidate_works_count = candidate.get("citation_count", "")
+        candidate_orc_id = ", ".join(v for k, v in other_ids.items() if k == "orcid")
+        candidate_scopus_id = ", ".join(v for k, v in other_ids.items() if k == "scopus")
+        candidate_works_count = candidate.get("works_count", "")
         candidate_cited_by_count = candidate.get("cited_by_count", "")
         # gather summary_stats for 2yr_mean_citedness, h_index, i10_index
         summary_stats = candidate.get("summary_stats", {})
         candidate_summary_stats = ", ".join(f"{k}: {v}" for k, v in summary_stats.items())
         # Process x_concepts safely by checking if the list is not empty
-        x_concepts = candidate.get("x_concepts", [])
-        candidate_field = x_concepts[0].get("display_name", "") if x_concepts else ""
+        topics = candidate.get("topics", [])
+        candidate_field_name = topics[0].get("field", {}).get("display_name", "") if topics else ""
+
+        candidate_revelance_score = None
         # Create a tuple with the candidate information
         candidate_tuple = (
             fs_id,
             candidate_name,
             candidate_display_name_alternatives,
-            candidate_field,
+            candidate_field_name,
             candidate_alex_id,
             candidate_orc_id,
             candidate_scopus_id,
             candidate_works_count,
             candidate_cited_by_count,
             candidate_summary_stats,
-            x_concepts
+            candidate_revelance_score,
+            topics
         )
         # Append the candidate tuple to the dictionary that uses fs_id as the key
         candidate_dict[fs_id].append(candidate_tuple)
@@ -83,44 +86,19 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
     email = "jcere@umich.edu"
     ins_id = None
 
-    # # Specific cases
-    if ins == "universidad politécnica de catalunya":
-        ins = "universitat politècnica de catalunya"
-    if ins == "universidad de alcalá de henares":
-        ins = "universidad de alcalá"
-    if ins == "universidad pública de navarra" or ins == "universidad de navarra en barcelona":
-        ins = "universidad publica de navarra"
-    if ins == "universidad pontificia de comillas en santander":
-        ins = "comillas pontifical university"
-    if ins == "universidad de valencia y tribunal de justicia de la comunidad valenciana" or ins == "universidad de valencia y consellería de sanitat i consum de la generalitat valenciana" or ins == "universidad literaria de valencia":
-        ins = "Universitat de València"
-    if ins == "universidad de les illes balears":
-        ins = "Universitat de les Illes Balears"
-    if ins == "consejo superior de investigaciones cientificas, csic" or ins == "consejo superior de investigaciones científicas idibaps":
-        ins = "Consejo Superior de Investigaciones Científicas"
-    if ins == "universidad nacional de eduación a distancia, uned":
-        ins = "National University of Distance Education"
-    if ins == "universidad técnica de dinamarca":
-        ins = "Technical University of Denmark"
-    if ins == "universidad de potsdam":
-        ins = "University of Potsdam"
-    if ins == "universidad de algarve":
-        ins = "University of Algarve"
-    if ins == "universidad rey juan carlos i":
-        ins = "Universidad Rey Juan Carlos"
 
    # Remove text after parentheses (), commas ,, slashes /, and dashes -
     ins_clean = re.sub(r"\s*(\(.*?\)|,.*|/.*|-.*)", "", ins or "").strip()
 
     # In the OpenAlex API to filter on institutions we first find the institution ID and then use it in the author search.
     # We will cache the institution ID for each unique institution name to avoid redundant API calls.
+    # Later in your code, when updating:
     if ins_clean not in ins_id_dict:
         institution_search = f"https://api.openalex.org/institutions?search={ins_clean}&mailto={email}"
         try:
             response = requests.get(institution_search)
             if response.status_code != 200:
                 print(f"Error fetching OpenAlex institution data for '{ins_clean}': status code {response.status_code}")
-                # Mark the institution as manual intervention
                 ins_id_dict[ins_clean] = "MANUAL_REQUIRED"
                 with open(cache_file, "w") as f:
                     json.dump(ins_id_dict, f)
@@ -128,26 +106,22 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
             data = response.json()
             if not data.get("results"):
                 print(f"No institution results for '{ins_clean}'")
-                # Mark the institution as needing manual intervention
                 ins_id_dict[ins_clean] = "MANUAL_REQUIRED"
                 with open(cache_file, "w") as f:
                     json.dump(ins_id_dict, f)
                 return None, None
             ins_id = data["results"][0]["id"]
             ins_id_dict[ins_clean] = ins_id
-            # Update the cache file for fast future access
             with open(cache_file, "w") as f:
                 json.dump(ins_id_dict, f)
         except Exception as e:
             print(f"Error fetching OpenAlex institution data for '{ins_clean}': {e}")
-            # Mark the institution as needing manual intervention
             ins_id_dict[ins_clean] = "MANUAL_REQUIRED"
             with open(cache_file, "w") as f:
                 json.dump(ins_id_dict, f)
             return None, None
     else:
         ins_id = ins_id_dict[ins_clean]
-
 
     # functionality that dynamically builds the OpenAlex API URL based on the information
     url = "https://api.openalex.org/authors?"
@@ -170,53 +144,86 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
     # Loop to create candidates list, stores multiple profiles per fs_id
     # Iterate sover the results from our first query
     if data.get("meta", {}).get("count", 0) > 0:
-        for candidate in data["results"]:
+        results = data["results"]
+        full_name_norm = full_name.strip().lower()
+
+
+        # Case 1: exact name or alternative match
+        for candidate in results:
             candidate_name = candidate.get("display_name", "")
             candidate_name_norm = candidate_name.strip().lower()
-
-            candidate_display_name_alternatives = candidate.get("display_name_alternatives", "")
-            # Normalize each alternative name in the list
+            candidate_display_name_alternatives = candidate.get("display_name_alternatives", [])
             alternatives_norm = [alt.strip().lower() for alt in candidate_display_name_alternatives]
 
-            full_name_norm = full_name.strip().lower()
-
-            # Case 1: Exact match on candidate_name or a match in the alternatives list
             if candidate_name_norm == full_name_norm or any(full_name_norm == alt for alt in alternatives_norm):
-                gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
-                print("Case 1")
+                candidate_alex_id = candidate.get("id", "")
+                # Skip if already added
+                if not any(candidate_alex_id == ct[4] for ct in candidate_dict.get(fs_id, [])):
+                    gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
+                    print("Case 1")
+
+        # Case 2: Institution match with additional fuzzy name check, reiterating over results
+        for candidate in results:
+            candidate_alex_id = candidate.get("id", "")
+            # Skip candidate if already added in Case 1
+            if any(candidate_alex_id == ct[4] for ct in candidate_dict.get(fs_id, [])):
+                continue
 
             affiliations = candidate.get("affiliations", [])
-            candidate_institutions = [aff.get("institution", {}).get("id", "")
-                          for aff in affiliations
-                          if aff.get("institution", {}).get("id")]
+            candidate_institutions = [
+                aff.get("institution", {}).get("id", "")
+                for aff in affiliations
+                if aff.get("institution", {}).get("id")
+            ]
 
-            # Case 2: Found match on institution ID
-            if (ins_id and ins_id in candidate_institutions):
-                gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
-                print("Case 2")
+            if ins_id and ins_id in candidate_institutions:
+                candidate_name = candidate.get("display_name", "")
+                candidate_name_norm = candidate_name.strip().lower()
+                similarity = difflib.SequenceMatcher(None, candidate_name_norm, full_name_norm).ratio()
+                # Only add if similarity exceeds threshold (e.g., 0.85)
+                if similarity > 0.85:
+                    gather_data(fs_id, candidate, candidate_name, candidate.get("display_name_alternatives", []))
+                    print("Case 2")
+
+        # Case 3: topics matching
+        for candidate in results:
+            candidate_alex_id = candidate.get("id", "")
+            # Skip candidate if already added in Cases 1 or 2
+            if any(candidate_alex_id == ct[4] for ct in candidate_dict.get(fs_id, [])):
+                continue
 
 
-            # Case 3: LAST RESORT, no match on name, inst. If we have found profile for this fs_id, we review x_concepts score
-            # LOGIC: check if we already have a profile for this fs_id
-            # if we do, check if the x_concepts match with the potential candidate profile
-            # if match, gather data
 
-            potential_candidate_x_concepts = candidate.get("x_concepts", [])
 
-            # Iterate over a copy of the current candidate list to avoid infinite looping if we add new items.
-            existing_candidates = candidate_dict[fs_id][:]
-            for candidate_tuple in existing_candidates:
-                existing_x_concepts = candidate_tuple[-1]  # List of x_concepts dictionaries from the stored candidate
-                for ex_concept in existing_x_concepts:
-                    for potential_concept in potential_candidate_x_concepts:
-                        if ex_concept.get("display_name") == potential_concept.get("display_name"):
-                            # Optional deduplication: check if candidate is already added by comparing candidate IDs
-                            candidate_alex_id = candidate.get("id", "")
-                            if not any(candidate_alex_id == ct[4] for ct in candidate_dict[fs_id]):
-                                gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
-                                print("Case 3")
+            existing_candidates = candidate_dict.get(fs_id, [])
+            potential_candidate_topics = candidate.get("topics", [])
 
-    return None, None
+            # Find the existing candidate with the highest relevance score for this fs_id
+            max_revelance_exisiting = 0
+            comparison_candidate = None
+            for existing_candidate in existing_candidates:
+                relevance = existing_candidate[10] if existing_candidate[10] is not None else 0
+                if relevance > max_revelance_exisiting:
+                    comparison_candidate = existing_candidate
+                    max_revelance_exisiting = relevance
+
+            # If no candidate has been added yet, skip Case 3
+            if comparison_candidate is None:
+                continue
+
+            # Get the topics list from the comparison candidate
+            existing_profile_topics = comparison_candidate[-1]  # topics list stored as the last element
+            # Compare only the top 2 topics from each list
+            for topic in existing_profile_topics[:2]:
+                for topic_comparison in potential_candidate_topics[:2]:
+                    # Safely get the display_name from the nested dictionaries
+                    topic_display = topic.get("field", {}).get("display_name", "")
+                    topic_comp_display = topic_comparison.get("field", {}).get("display_name", "")
+                    if topic_display == topic_comp_display:
+                        gather_data(fs_id, candidate, candidate.get("display_name", ""), candidate.get("display_name_alternatives", []))
+                        print("Case 3")
+                        # Once a match is found for this candidate, no need to check further:
+                        break
 
 # Process all researchers to build candidate_dict
 for i, (fs_id, name, ap1, full_name, pais, ins) in enumerate(
