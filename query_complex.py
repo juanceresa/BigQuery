@@ -2,7 +2,18 @@ import pandas as pd
 import requests
 from google.cloud import bigquery
 import re
+import json
+import os
 
+# Global file for caching institution IDs
+cache_file = "ins_id_cache.json"
+
+# Load the institution cache from file if it exists; otherwise, start with an empty dictionary.
+if os.path.exists(cache_file):
+    with open(cache_file, "r") as f:
+        ins_id_dict = json.load(f)
+else:
+    ins_id_dict = {}
 
 '''
 1. Buscar a AlexID con nombre 1 y Apellido 1
@@ -108,16 +119,31 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
         try:
             response = requests.get(institution_search)
             if response.status_code != 200:
-                print(f"Error fetching OpenAlex institution data for '{ins}': status code {response.status_code}")
+                print(f"Error fetching OpenAlex institution data for '{ins_clean}': status code {response.status_code}")
+                # Mark the institution as manual intervention
+                ins_id_dict[ins_clean] = "MANUAL_REQUIRED"
+                with open(cache_file, "w") as f:
+                    json.dump(ins_id_dict, f)
                 return None, None
             data = response.json()
             if not data.get("results"):
-                print(f"No institution results for '{ins}'")
+                print(f"No institution results for '{ins_clean}'")
+                # Mark the institution as needing manual intervention
+                ins_id_dict[ins_clean] = "MANUAL_REQUIRED"
+                with open(cache_file, "w") as f:
+                    json.dump(ins_id_dict, f)
                 return None, None
             ins_id = data["results"][0]["id"]
             ins_id_dict[ins_clean] = ins_id
+            # Update the cache file for fast future access
+            with open(cache_file, "w") as f:
+                json.dump(ins_id_dict, f)
         except Exception as e:
-            print(f"Error fetching OpenAlex institution data for '{ins}': {e}")
+            print(f"Error fetching OpenAlex institution data for '{ins_clean}': {e}")
+            # Mark the institution as needing manual intervention
+            ins_id_dict[ins_clean] = "MANUAL_REQUIRED"
+            with open(cache_file, "w") as f:
+                json.dump(ins_id_dict, f)
             return None, None
     else:
         ins_id = ins_id_dict[ins_clean]
@@ -158,7 +184,6 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
             if candidate_name_norm == full_name_norm or any(full_name_norm == alt for alt in alternatives_norm):
                 gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
                 print("Case 1")
-                return None, None
 
             affiliations = candidate.get("affiliations", [])
             candidate_institutions = [aff.get("institution", {}).get("id", "")
@@ -168,23 +193,28 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
             # Case 2: Found match on institution ID
             if (ins_id and ins_id in candidate_institutions):
                 gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
-                return None, None
+                print("Case 2")
+
 
             # Case 3: LAST RESORT, no match on name, inst. If we have found profile for this fs_id, we review x_concepts score
             # LOGIC: check if we already have a profile for this fs_id
             # if we do, check if the x_concepts match with the potential candidate profile
             # if match, gather data
+
             potential_candidate_x_concepts = candidate.get("x_concepts", [])
 
-            if fs_id in candidate_dict:
-                for candidate_tuple in candidate_dict[fs_id]:
-                    existing_x_concepts = candidate_tuple[-1]  # List of x_concepts dictionaries from the stored candidate
-                    for ex_concept in existing_x_concepts:
-                        for potential_concept in potential_candidate_x_concepts:
-                            if ex_concept.get("display_name") == potential_concept.get("display_name"):
+            # Iterate over a copy of the current candidate list to avoid infinite looping if we add new items.
+            existing_candidates = candidate_dict[fs_id][:]
+            for candidate_tuple in existing_candidates:
+                existing_x_concepts = candidate_tuple[-1]  # List of x_concepts dictionaries from the stored candidate
+                for ex_concept in existing_x_concepts:
+                    for potential_concept in potential_candidate_x_concepts:
+                        if ex_concept.get("display_name") == potential_concept.get("display_name"):
+                            # Optional deduplication: check if candidate is already added by comparing candidate IDs
+                            candidate_alex_id = candidate.get("id", "")
+                            if not any(candidate_alex_id == ct[4] for ct in candidate_dict[fs_id]):
                                 gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
                                 print("Case 3")
-                                return None, None
 
     return None, None
 
@@ -195,6 +225,7 @@ for i, (fs_id, name, ap1, full_name, pais, ins) in enumerate(
     # Execute the search, which fills in the candidate_dict for fs_id
     search_openalex(fs_id, query_name, full_name, pais, ins)
 
+# Create a DataFrame for all candidate rows after processing all researchers
 # Create a DataFrame for all candidate rows after processing all researchers
 candidate_rows = []
 for fs_id, candidates in candidate_dict.items():
@@ -213,15 +244,15 @@ for fs_id, candidates in candidate_dict.items():
     ])
     candidate_rows.append(df_candidates)
 
-    # Concatenate all candidate DataFrames into one
-    df_candidates_final = pd.concat(candidate_rows, ignore_index=True)
+# Concatenate all candidate DataFrames into one (done once)
+df_candidates_final = pd.concat(candidate_rows, ignore_index=True)
 
-    # Sort the DataFrame by fs_id in ascending order
-    df_candidates_final = df_candidates_final.sort_values(by="fs_id").reset_index(drop=True)
+# Sort the DataFrame by fs_id in ascending order
+df_candidates_final = df_candidates_final.sort_values(by="fs_id").reset_index(drop=True)
 
 # Merge with the original df_main based on fs_id (ID)
 df_final = df_main.merge(df_candidates_final, left_on="ID", right_on="fs_id", how="left")
 
-table_id = "userdb_JC.investigadores_alexapi_1"
+table_id = "userdb_JC.investigadores_alexapi_3"
 job_config_load = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
 client.load_table_from_dataframe(df_final, table_id, job_config=job_config_load).result()
