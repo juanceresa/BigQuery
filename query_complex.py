@@ -5,16 +5,7 @@ import re
 import json
 import os
 import difflib
-
-# Global file for caching institution IDs
-cache_file = "ins_id_cache.json"
-
-# Load the institution cache from file if it exists; otherwise, start with an empty dictionary.
-if os.path.exists(cache_file):
-    with open(cache_file, "r") as f:
-        ins_id_dict = json.load(f)
-else:
-    ins_id_dict = {}
+import unicodedata
 
 '''
 1. Buscar a AlexID con nombre 1 y Apellido 1
@@ -29,6 +20,55 @@ else:
     3. las otros ( ponga bandera para resolver )
     4. Entonces tenemos un Alex_ids verificados y no verificados
 '''
+
+def normalize_name(name):
+    # Convert to lowercase and strip whitespace
+    norm = name.strip().lower()
+    # Remove accents: decompose Unicode characters and filter out combining marks
+    norm = unicodedata.normalize('NFKD', norm)
+    norm = "".join(ch for ch in norm if not unicodedata.combining(ch))
+    # Replace hyphen-like characters with a space
+    norm = re.sub(r"[-‐]", " ", norm)
+    # Remove punctuation but keep alphanumeric characters and whitespace
+    norm = "".join(ch for ch in norm if ch.isalnum() or ch.isspace())
+    # Collapse multiple spaces into one
+    norm = re.sub(r"\s+", " ", norm)
+    return norm
+
+def bag_of_words(candidate_tokens, full_name_tokens, candidate_name):
+    # We check in a bag-of-words method on our profile
+    # A profile could omit one of our last names we have in our full name, but we will never see a name we don't expect
+    for i, token in enumerate(candidate_tokens):
+        # the goal here is to check if the first letter in the same position of the full substring is the same
+        # if it is not, then we skip this candidate
+        if len(token) < 2:
+            if full_name_tokens[i][0] != token:
+                print(f"EXPECTED INITIAL={full_name_tokens[i][0]}, GOT={token}, {full_name}, {candidate_name}\n")
+                missing_token = token
+                reject_candidate = True
+                break
+        # Check if this token appears as an exact match in any query token
+        if token not in full_name_tokens:
+            missing_token = token
+            reject_candidate = True
+            break
+    if reject_candidate:
+        print (full_name_tokens, candidate_tokens)
+        print(f"SKIP, {full_name}, {candidate_name}, missing token: {missing_token}\n")
+
+
+
+
+# Global file for caching institution IDs
+cache_file = "ins_id_cache.json"
+
+# Load the institution cache from file if it exists; otherwise, start with an empty dictionary.
+if os.path.exists(cache_file):
+    with open(cache_file, "r") as f:
+        ins_id_dict = json.load(f)
+else:
+    ins_id_dict = {}
+
 
 # Initialize BigQuery client
 client = bigquery.Client(project="steadfast-task-437611-f3")
@@ -145,27 +185,34 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
     # Iterate sover the results from our first query
     if data.get("meta", {}).get("count", 0) > 0:
         results = data["results"]
-        full_name_norm = full_name.strip().lower()
+        full_name_norm = normalize_name(full_name)
 
+        ### LOOPS TO ITERATE OVER THE RESULTS ###
 
-        # Case 1: exact name or alternative match
+        ### Case 1: exact name or alternative match (iteration 1) ###
         for candidate in results:
             candidate_name = candidate.get("display_name", "")
-            candidate_name_norm = candidate_name.strip().lower()
+            candidate_name_norm = normalize_name(candidate_name)
             candidate_display_name_alternatives = candidate.get("display_name_alternatives", [])
-            alternatives_norm = [alt.strip().lower() for alt in candidate_display_name_alternatives]
+            alternatives_norm = [normalize_name(alt) for alt in candidate_display_name_alternatives]
 
             if candidate_name_norm == full_name_norm or any(full_name_norm == alt for alt in alternatives_norm):
                 candidate_alex_id = candidate.get("id", "")
                 # Skip if already added
                 if not any(candidate_alex_id == ct[4] for ct in candidate_dict.get(fs_id, [])):
                     gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives)
-                    print("Case 1")
+                    print(f"EXACT MATCH: {full_name}, {candidate_name}")
 
-        # Case 2: Institution match with additional fuzzy name check, reiterating over results
+        ### Case 2: Institution match with additional fuzzy name check (iteration 2) ###
         for candidate in results:
             candidate_alex_id = candidate.get("id", "")
-            # Skip candidate if already added in Case 1
+            candidate_name = candidate.get("display_name", "")
+
+            full_name_tokens = normalize_name(full_name).split()
+            candidate_tokens = normalize_name(candidate_name).split()
+
+
+            # Skip candidate profile if already added in Case 1
             if any(candidate_alex_id == ct[4] for ct in candidate_dict.get(fs_id, [])):
                 continue
 
@@ -176,30 +223,77 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
                 if aff.get("institution", {}).get("id")
             ]
 
+            reject_candidate = False
             if ins_id and ins_id in candidate_institutions:
-                candidate_name = candidate.get("display_name", "")
-                candidate_name_norm = candidate_name.strip().lower()
-                similarity = difflib.SequenceMatcher(None, candidate_name_norm, full_name_norm).ratio()
-                # Only add if similarity exceeds threshold (e.g., 0.85)
-                if similarity > 0.85:
+
+                    # We check in a bag-of-words method on our profile
+                    # A profile could omit one of our last names we have in our full name, but we will never see a name we don't expect
+                    for i, token in enumerate(candidate_tokens):
+                        # the goal here is to check if the first letter in the same position of the full substring is the same
+                        # if it is not, then we skip this candidate
+                        if len(token) < 2:
+                            if full_name_tokens[i][0] != token:
+                                print(f"EXPECTED INITIAL={full_name_tokens[i][0]}, GOT={token}, {full_name}, {candidate_name}\n")
+                                missing_token = token
+                                reject_candidate = True
+                                break
+                        # Check if this token appears as an exact match in any query token
+                        if token not in full_name_tokens:
+                            missing_token = token
+                            reject_candidate = True
+                            break
+
+                    if reject_candidate:
+                        print (full_name_tokens, candidate_tokens)
+                        print(f"SKIP, {full_name}, {candidate_name}, missing token: {missing_token}\n")
+                        break  # Skip this candidate profile
+
                     gather_data(fs_id, candidate, candidate_name, candidate.get("display_name_alternatives", []))
-                    print("Case 2")
+                    print(f"INS MATCH: {full_name}, {candidate_name}, {ins}")
 
         # Case 3: topics matching
         for candidate in results:
             candidate_alex_id = candidate.get("id", "")
-            # Skip candidate if already added in Cases 1 or 2
+            candidate_name = candidate.get("display_name", "")
+
+            # Skip candidate profile if already added in Cases 1 or 2
             if any(candidate_alex_id == ct[4] for ct in candidate_dict.get(fs_id, [])):
                 continue
 
+            full_name_tokens = normalize_name(full_name).split()
+            candidate_tokens = normalize_name(candidate_name).split()
 
+            print (f"{full_name_tokens}, {candidate_tokens}\n")
 
+            reject_candidate = False
+
+            # We check in a bag-of-words method on our profile
+            # A profile could omit one of our last names we have in our full name, but we will never see a name we don't expect
+            for i, token in enumerate(candidate_tokens):
+                 # the goal here is to check if the first letter in the same position of the full substring is the same
+                 # if it is not, then we skip this candidate
+                if len(token) < 2:
+                    if full_name_tokens[i][0] != token:
+                        print(f"EXPECTED INITIAL={full_name_tokens[i][0]}, GOT={token}, {full_name}, {candidate_name}\n")
+                        missing_token = token
+                        reject_candidate = True
+                        break
+                # Check if this token appears as an exact match in any query token
+                if token not in full_name_tokens:
+                    missing_token = token
+                    reject_candidate = True
+                    break
+
+            if reject_candidate:
+                print (full_name_tokens, candidate_tokens)
+                print(f"SKIP, {full_name}, {candidate_name}, missing token: {missing_token}\n")
+                break  # Skip this candidate profile
 
             existing_candidates = candidate_dict.get(fs_id, [])
             potential_candidate_topics = candidate.get("topics", [])
 
             # Find the existing candidate with the highest relevance score for this fs_id
-            max_revelance_exisiting = 0
+            max_revelance_exisiting = -1
             comparison_candidate = None
             for existing_candidate in existing_candidates:
                 relevance = existing_candidate[10] if existing_candidate[10] is not None else 0
@@ -221,7 +315,10 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
                     topic_comp_display = topic_comparison.get("field", {}).get("display_name", "")
                     if topic_display == topic_comp_display:
                         gather_data(fs_id, candidate, candidate.get("display_name", ""), candidate.get("display_name_alternatives", []))
-                        print("Case 3")
+                        print(f"\n----- MATCH -----")
+                        print ("TRUE: ", comparison_candidate[1], comparison_candidate[2])
+                        print("COMPARISON: ", candidate.get("display_name", ""))
+                        print(f"{topic_display}, {topic_comp_display}\n")
                         # Once a match is found for this candidate, no need to check further:
                         break
 
