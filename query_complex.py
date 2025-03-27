@@ -34,23 +34,31 @@ def normalize_name(name):
     norm = re.sub(r"\s+", " ", norm)
     return norm
 
-def bag_of_words(candidate_tokens, full_name_tokens, candidate_name, reject_candidate=False):
+def bag_of_words(candidate_tokens, full_name_tokens, candidate_name, candidate_alex_id, reject_candidate=False):
+    if candidate_alex_id in reject_dict:
+        return True
     # We check in a bag-of-words method on our profile
     # A profile could omit one of our last names we have in our full name, but we will never see a name we don't expect
     for i, token in enumerate(candidate_tokens):
+        # If candidate has more tokens than full_name, then this token is extra.
+        if i >= len(full_name_tokens):
+            missing_token = token
+            reject_candidate = True
+            break
         # the goal here is to check if the first letter in the same position of the full substring is the same
         # if it is not, then we skip this candidate
-        if len(token) < 1:
-            if full_name_tokens[i][0] != token:
+        if len(token) < 2:
+            if token != full_name_tokens[i][0]:
                 print(f"EXPECTED INITIAL={full_name_tokens[i][0]}, GOT={token}, {full_name}, {candidate_name}\n")
                 missing_token = token
                 reject_candidate = True
                 break
         # Check if this token appears as an exact match in any query token
-        elif token not in full_name_tokens:
-            missing_token = token
-            reject_candidate = True
-            break
+        else:
+            if token not in full_name_tokens:
+                missing_token = token
+                reject_candidate = True
+                break
     if reject_candidate:
         print(f"SKIP")
         print(f"NAME: {full_name}")
@@ -58,7 +66,6 @@ def bag_of_words(candidate_tokens, full_name_tokens, candidate_name, reject_cand
         print(f"Missing Token: {missing_token}\n")
         return reject_candidate
     return False
-
 
 
 # Global file for caching institution IDs
@@ -84,6 +91,7 @@ df_main = client.query(query_inv).to_dataframe()
 
 # Create a global cache for candidate data
 candidate_dict = {}
+reject_dict = {}
 
 
 def gather_data(fs_id, candidate, candidate_name, candidate_display_name_alternatives):
@@ -151,7 +159,7 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
                 ins_id_dict[ins_clean] = "MANUAL_REQUIRED"
                 with open(cache_file, "w") as f:
                     json.dump(ins_id_dict, f)
-                return None, None
+                return None, None 
             ins_id = data["results"][0]["id"]
             ins_id_dict[ins_clean] = ins_id
             with open(cache_file, "w") as f:
@@ -219,9 +227,11 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
             if any(candidate_alex_id == ct[4] for ct in candidate_dict.get(fs_id, [])):
                 continue
             # Skip candidate if we have a token mismatch
-            reject = bag_of_words(candidate_tokens, full_name_tokens, candidate_name)
+            reject = bag_of_words(candidate_tokens, full_name_tokens, candidate_name, candidate_alex_id)
             if reject:
-                break
+                if candidate_alex_id not in reject_dict:
+                    reject_dict[candidate_alex_id] = True
+                continue
 
             affiliations = candidate.get("affiliations", [])
             candidate_institutions = [
@@ -242,17 +252,19 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
             candidate_alex_id = candidate.get("id", "")
             candidate_name = candidate.get("display_name", "")
 
-            full_name_tokens = normalize_name(full_name).split()
-            candidate_tokens = normalize_name(candidate_name).split()
+            full_name_tokens = sorted(normalize_name(full_name).split())
+            candidate_tokens = sorted(normalize_name(candidate_name).split())
 
             # Skip candidate profile if already added in Cases 1 or 2
             if any(candidate_alex_id == ct[4] for ct in candidate_dict.get(fs_id, [])):
                 continue
 
             # Skip candidate if we have a token mismatch
-            reject = bag_of_words(candidate_tokens, full_name_tokens, candidate_name)
+            reject = bag_of_words(candidate_tokens, full_name_tokens, candidate_name, candidate_alex_id)
             if reject:
-                break
+                if reject_dict.get(candidate_alex_id, False):
+                    reject_dict[candidate_alex_id] = True
+                continue
 
             existing_candidates = candidate_dict.get(fs_id, [])
             potential_candidate_topics = candidate.get("topics", [])
@@ -288,7 +300,7 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
                         gather_data(fs_id, candidate, candidate_name, candidate.get("display_name_alternatives", []))
                         # Once a match is found for this candidate, no need to check further:
                         break
-            break
+            continue
 
 # Process all researchers to build candidate_dict
 for i, (fs_id, name, ap1, full_name, pais, ins) in enumerate(
@@ -302,7 +314,7 @@ for i, (fs_id, name, ap1, full_name, pais, ins) in enumerate(
 candidate_rows = []
 for fs_id, candidates in candidate_dict.items():
     # Drops the x_concepts column from the candidate tuple, as it is not needed in the final DataFrame
-    df_candidates = pd.DataFrame([t[:-1] for t in candidates], columns=[
+    df_candidates = pd.DataFrame([t[:-2] for t in candidates], columns=[
         "fs_id",
         "candidate_name",
         "candidate_display_name_alternatives",
