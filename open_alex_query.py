@@ -159,7 +159,7 @@ def search_openalex(fs_id, q_name, full_name, pais, ins):
                 ins_id_dict[ins_clean] = "MANUAL_REQUIRED"
                 with open(cache_file, "w") as f:
                     json.dump(ins_id_dict, f)
-                return None, None 
+                return None, None
             ins_id = data["results"][0]["id"]
             ins_id_dict[ins_clean] = ins_id
             with open(cache_file, "w") as f:
@@ -309,7 +309,6 @@ for i, (fs_id, name, ap1, full_name, pais, ins) in enumerate(
     # Execute the search, which fills in the candidate_dict for fs_id
     search_openalex(fs_id, query_name, full_name, pais, ins)
 
-# Create a DataFrame for all candidate rows after processing all researchers
 # Create a DataFrame for all candidate rows after processing all researchers
 candidate_rows = []
 for fs_id, candidates in candidate_dict.items():

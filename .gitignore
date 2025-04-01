@@ -173,4 +173,18 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+#Elsa
 config.json
+.cache
+config.json
+niso_training_prog.py
+test_elsapy.py
+dump.json
+*.pyc
+*.log
+/data
+/test_data
+/logs
+/dist
+/build
+/elsapy.egg-info
